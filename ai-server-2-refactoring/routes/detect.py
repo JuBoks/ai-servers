@@ -1,115 +1,60 @@
-from fastapi import APIRouter, Body, HTTPException, status
+from fastapi import APIRouter, Body, HTTPException
 
-from database.detect import *
 from models.common import Response
-from models.detect import *
-from services.detect_service import *
-from utils.common import send_cat_tnr_info
+from models.detect import UpdateDetectTnrModel
+import services.detect_service as detect_service
 
-router = APIRouter()
-
-BACK_AI_URL = os.environ["BACK_AI_URL"]
+router = APIRouter(prefix="/detect")
 
 
 @router.post(
-    "/detection",
-    response_description="[Batch]CPU-Bound Detection (takes about 30sec)",
+    "/batch",
+    summary="[Batch]CPU-Bound Detection (takes about 30sec)",
     response_model=Response,
 )
 async def batch_result(serial_number: str, date: str):
     # face detection 수행 및 결과 도출
-    result = await face_detection(serial_number, date)
-    if result["status_code"] == 500:
-        # Back서버에 개체 수와 tnr 수 update하기
-        isSuccess = send_cat_tnr_info(BACK_AI_URL, serial_number, date, 0, 0)
-        raise HTTPException(status_code=500, detail=f"Server Error")
-
-    content = result["content"]
-    num_clusters = content["num_clusters"]
-    tnr_count = content["tnr_count"]
-
-    result = Detect(**content)
-    try:
-        new_result = await add_detect(result)
-
-        # Back서버에 개체 수와 tnr 수 update하기
-        isSuccess = send_cat_tnr_info(
-            BACK_AI_URL,
-            serial_number,
-            date,
-            num_clusters,
-            tnr_count,
-        )
-
-    except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=f"Couldn't save result")
-
-    if isSuccess == False:
+    result = await detect_service.face_detection(serial_number, date)
+    if result.status_code == 600:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error.")
+    elif result.status_code == 601:
         raise HTTPException(
             status_code=500, detail=f"Sending cluster information is failed."
         )
 
-    return Response(status_code=status.HTTP_201_CREATED, content=new_result)
-
+    result.status_code = 200
+    return result
 
 @router.get(
-    "/info",
-    response_description="search result by serial number and date",
+    "/tnr",
+    summary="분석결과 중 tnr관련 정보만 조회",
     response_model=Response,
 )
-async def get_batch_results(serial_number: str, date: str):
-    results = await retrieve_detect(serial_number, date)
-    return Response(status_code=status.HTTP_200_OK, content=results)
-
+async def get_tnr_datas(serial_number: str, date: str) -> Response:
+    return await detect_service.retrieve_tnr(serial_number, date)
 
 @router.put(
-    "/info",
-    response_description="modify result",
+    "/tnr",
+    summary="분석결과 중 tnr관련 정보만 수정",
     response_model=Response,
 )
-async def get_batch_results(
-    serial_number: str, date: str, req: UpdateDetectModel = Body(...)
-):
-    # id 찾기
-    detect = await retrieve_detect(serial_number, date)
+async def put_tnr_datas(serial_number: str, date: str, req: UpdateDetectTnrModel = Body(...)) -> Response:
+    return await detect_service.update_detect(serial_number, date, req.dict())
 
-    if detect is not None:
-        updated_detect = await update_detect_data(detect.id, req.dict())
-        if updated_detect:
-            return Response(status_code=status.HTTP_200_OK, content=updated_detect)
+@router.put(
+    "/undo",
+    summary="분석결과를 원본으로 초기화하기",
+    response_model=Response,
+)
+async def put_detect_undo(
+    serial_number: str, date: str
+) -> Response:
+    return await detect_service.update_detect_undo(serial_number, date)
 
-    raise HTTPException(status_code=404, detail=f"Student {id} not found")
-
-
-@router.get("/representatives", response_description="대표이미지 조회")
-async def get_representatives(serial_number: str):
-    # 파일 읽어오기
-    json_file = await retrieve_detect_representatives(serial_number)
-
-    # '날짜': [] 형태로 result 만들기
-    result = {}
-    for el in json_file:
-        result[el.date] = el.representative_images
-
-    return result
-
-
-@router.get("/info/status", response_description="분석 결과 status 조회")
-async def get_info_status(serial_number: str):
-    # 파일 읽어오기
-    json_file = await retrieve_detect_status(serial_number)
-
-    # '날짜': int 형태로 result 만들기
-    result = {}
-    for el in json_file:
-        result[el.date] = el.status
-
-    return result
 
 
 # @router.get(
-#     "/detection", response_description="get all results", response_model=Response
+#     "/", summary="get all results", response_model=Response
 # )
 # async def get_batch_results():
 #     results = await retrieve_detects()

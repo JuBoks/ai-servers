@@ -23,10 +23,10 @@ def is_tnr_by_yolo():
         output = output.decode("utf-8")
         result_arr = ast.literal_eval(output)
 
-        if result_arr[0] and result_arr[1]:
-            return True
-        else:
-            return False
+        # result_arr[0] : cat 여부
+        # result_arr[1] : 중성화 여부
+        return result_arr[1]
+    
     except subprocess.CalledProcessError as e:
         print(f"오류: {e}\n종료 상태: {e.returncode}")
         return False

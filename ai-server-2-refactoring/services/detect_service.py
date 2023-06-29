@@ -1,45 +1,52 @@
 import os
-import requests
-from utils.common import *
-from .face_detection import detection
+from fastapi import HTTPException, status
+
 from .image_clustering import cluster_images
 from .tnr_filtering import detect_tnr
-
+from utils.common import send_cat_tnr_info, get_files
+# models
+from models.common import Response
+from models.detect import Detect
+from models.original import Original
+# dao
+import database.detect as detect_dao
+import database.original as original_dao
 
 FILE_SAVE_PATH = os.path.abspath("datasets/0_files")
 
 BACK_URL = os.environ["BACK_URL"]
 BACK_AI_URL = os.environ["BACK_AI_URL"]
 
+async def retrieve_detect(serial_number: str, date: str) -> Response:
+    results = await detect_dao.retrieve_detect(serial_number, date)
+    return Response(status_code=status.HTTP_200_OK, content=results)
 
-def get_files(serial_number, date, file_path):
-    # 폴더 비우기
-    empty_directory(f"{file_path}/*")
+async def retrieve_tnr(serial_number: str, date: str) -> Response:
+    result = await detect_dao.retrieve_detect_tnr(serial_number, date)
+    return Response(status_code=status.HTTP_200_OK, content=result)
 
-    # 사진 파일 가져오기
-    url = "/ai/image"
-    params = {"date": date, "dishSerialNum": serial_number}
-    response = requests.get(BACK_URL + url, params=params)
-    # 응답 처리
-    if response.status_code != 200:
-        return {"status": 500, "message": "get files failed."}
+async def retrieve_status(serial_number: str) -> Response:
+    json_file = await detect_dao.retrieve_detect_status(serial_number)
 
-    result = response.json()  # JSON 응답 데이터 파싱
+    # '날짜': int 형태로 result 만들기
+    result = {}
+    for el in json_file:
+        result[el.date] = el.status
 
-    os.makedirs(file_path, exist_ok=True)
+    return Response(status_code=status.HTTP_200_OK, content=result)
 
-    img_info = {}
-    for el in result["data"]:
-        path = el["imagePath"]
-        id = el["dishImageId"]
-        save_image_from_url(path, f"{file_path}/{id}.jpg")
-        img_info[f"{id}.jpg"] = path
+async def retrieve_representatives(serial_number: str) -> Response:
+    json_file = await detect_dao.retrieve_detect_representatives(serial_number)
 
-    return img_info
+    # '날짜': [] 형태로 result 만들기
+    result = {}
+    for el in json_file:
+        result[el.date] = el.representative_images
 
+    return Response(status_code=status.HTTP_200_OK, content=result)
 
-async def face_detection(serial_number, date):
-    status_code = 500
+async def face_detection(serial_number: str, date: str) -> Response:
+    result = Response()
 
     try:
         # 시리얼번호에 따른 경로 찾기
@@ -53,29 +60,70 @@ async def face_detection(serial_number, date):
         # detection(file_path)
 
         # 3. cluster 진행
-        result = cluster_images(serial_number)
+        content = cluster_images(serial_number)
 
         # 4. tnr판별
-        result_tnr, tnrCount = detect_tnr()
+        content_tnr, tnrCount = detect_tnr()
 
         # 5. 데이터 정제
-        for el in result["representative_images"]:
+        for el in content["representative_images"]:
             el[1] = img_info[el[1]]
-        for el in result["file_feature_info"]:
+        for el in content["file_feature_info"]:
             el[0] = img_info[el[0]]
-        for images in result["closest_images"]:
+        for images in content["closest_images"]:
             for i in range(len(images)):
                 images[i] = img_info[images[i]]
-        result["tnr_info"] = []
-        for el in result_tnr:
-            result["tnr_info"].append([img_info[el[0]], el[1]])
-        result["tnr_count"] = tnrCount
-        result["serial_number"] = serial_number
-        result["date"] = date
+        content["tnr_info"] = []
+        for el in content_tnr:
+            content["tnr_info"].append([img_info[el[0]], el[1]])
+        content["tnr_count"] = tnrCount
+        content["serial_number"] = serial_number
+        content["date"] = date
 
-        status_code = 200
+        # 6. mongoDB에 저장
+        content_detect = Detect(**content)
+        new_content = await detect_dao.add_detect(content_detect)
+        content_original = Original(**content)
+        await original_dao.add_original(content_original)
 
-    except:
-        result = {"status": -1, "serial_number": serial_number, "date": date}
+        # 7. Back서버에 개체 수와 tnr 수 update하기
+        isSuccess = send_cat_tnr_info(serial_number, date, content_detect.num_clusters, content_detect.tnr_count)
 
-    return {"status_code": status_code, "content": result}
+        if isSuccess == False:
+            result.status_code = 601
+            return result
+
+        # 8. 성공
+        result.content = new_content
+        result.status_code = 200
+
+    except Exception as e:
+        result.status_code = 600
+
+    return result
+
+async def update_detect(serial_number: str, date: str, data: dict):
+    # id 찾기
+    detect = await detect_dao.retrieve_detect(serial_number, date)
+    if detect is None:
+        raise HTTPException(status_code=404, detail=f"Detect is not found")
+    
+    # 업데이트 하기
+    updated_detect = await detect_dao.update_detect(detect.id, data)
+    if updated_detect is None:
+        raise HTTPException(status_code=500, detail=f"Updating Detect is failed")
+
+    # Back서버에 tnr관련 update하기
+    send_cat_tnr_info(serial_number, date, detect.num_clusters, detect.tnr_count)
+
+    return Response(status_code=status.HTTP_200_OK, content=updated_detect)
+
+
+async def update_detect_undo(serial_number: str, date: str):
+    # 원본찾기
+    original = await original_dao.retrieve_original(serial_number, date)
+
+    if original is None:
+        raise HTTPException(status_code=404, detail=f"Original is not found")
+    
+    return await update_detect(serial_number, date, original.dict())
